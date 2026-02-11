@@ -130,7 +130,7 @@ services:
   # PostgreSQL
   # ============================================================================
   db:
-    image: postgres:17
+    image: pgvector/pgvector:pg17
     container_name: dispatcharr_db
     ports:
       - "5436:5432"

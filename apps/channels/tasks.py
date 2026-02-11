@@ -262,6 +262,20 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
     epg_embeddings = None
     ml_available = use_ml
 
+    # Check for Vector DB capability
+    from django.db import connection
+    use_vector_db = False
+    if connection.vendor == 'postgresql':
+        try:
+             from apps.epg.models import EPGEmbedding
+             from pgvector.django import CosineDistance
+             # Check if we have any embeddings
+             if EPGEmbedding.objects.exists():
+                 use_vector_db = True
+                 logger.info("Using Vector DB for ML matching")
+        except ImportError:
+             pass
+
     # Automatically determine matching strategy based on number of channels
     is_bulk_matching = len(channels_data) > 1
 
@@ -387,106 +401,73 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
             matched_channels.append((chan['id'], chan['name'], best_epg["tvg_id"]))
             logger.info(f"Channel {chan['id']} '{chan['name']}' => matched tvg_id={best_epg['tvg_id']} (score={best_score})")
 
-        # Medium confidence - use ML if available (lazy load models here)
-        elif best_score >= FUZZY_MEDIUM_CONFIDENCE and ml_available:
-            # Lazy load ML models only when we actually need them
+        # ML Matching (Vector DB or In-Memory)
+        elif ml_available and best_score >= FUZZY_LAST_RESORT_MIN:
+            # Lazy load ML models
             if st_model is None:
                 st_model, util = get_sentence_transformer()
 
-            # Lazy generate embeddings only when we actually need them
-            if epg_embeddings is None and st_model and any(row.get("norm_name") for row in epg_data):
+            matched_epg = None
+            top_value = 0.0
+
+            # Use Vector DB if available
+            if use_vector_db and st_model:
                 try:
-                    logger.info("Generating embeddings for EPG data using ML model (lazy loading)")
-                    epg_embeddings = st_model.encode(
-                        [row["norm_name"] for row in epg_data if row.get("norm_name")],
-                        convert_to_tensor=True
-                    )
+                    chan_embedding = st_model.encode(chan["norm_chan"])
+                    match = EPGEmbedding.objects.filter(epg__epg_source__is_active=True).annotate(
+                         distance=CosineDistance('embedding', chan_embedding.tolist())
+                    ).order_by('distance').first()
+
+                    if match:
+                        top_value = 1.0 - match.distance
+                        matched_epg = {
+                            'id': match.epg_id,
+                            'tvg_id': match.epg.tvg_id
+                        }
                 except Exception as e:
-                    logger.warning(f"Failed to generate embeddings: {e}")
-                    epg_embeddings = None
+                    logger.warning(f"Vector DB matching failed: {e}")
 
-            if epg_embeddings is not None and st_model:
-                try:
-                    # Generate embedding for this channel
-                    chan_embedding = st_model.encode(chan["norm_chan"], convert_to_tensor=True)
+            # Fallback to In-Memory if Vector DB not used or failed
+            elif st_model:
+                # Lazy generate embeddings
+                if epg_embeddings is None and any(row.get("norm_name") for row in epg_data):
+                    try:
+                        logger.info("Generating embeddings for EPG data using ML model (lazy loading)")
+                        epg_embeddings = st_model.encode(
+                            [row["norm_name"] for row in epg_data if row.get("norm_name")],
+                            convert_to_tensor=True
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to generate embeddings: {e}")
+                        epg_embeddings = None
 
-                    # Calculate similarity with all EPG embeddings
-                    sim_scores = util.cos_sim(chan_embedding, epg_embeddings)[0]
-                    top_index = int(sim_scores.argmax())
-                    top_value = float(sim_scores[top_index])
+                if epg_embeddings is not None:
+                    try:
+                        chan_embedding = st_model.encode(chan["norm_chan"], convert_to_tensor=True)
+                        sim_scores = util.cos_sim(chan_embedding, epg_embeddings)[0]
+                        top_index = int(sim_scores.argmax())
+                        top_value = float(sim_scores[top_index])
 
-                    if top_value >= ML_HIGH_CONFIDENCE:
-                        # Find the EPG entry that corresponds to this embedding index
                         epg_with_names = [epg for epg in epg_data if epg.get("norm_name")]
                         matched_epg = epg_with_names[top_index]
+                    except Exception as e:
+                        logger.warning(f"In-memory ML matching failed: {e}")
 
-                        chan["epg_data_id"] = matched_epg["id"]
-                        channels_to_update.append(chan)
-                        matched_channels.append((chan['id'], chan['name'], matched_epg["tvg_id"]))
-                        logger.info(f"Channel {chan['id']} '{chan['name']}' => matched EPG tvg_id={matched_epg['tvg_id']} (fuzzy={best_score}, ML-sim={top_value:.2f})")
-                    else:
-                        logger.info(f"Channel {chan['id']} '{chan['name']}' => fuzzy={best_score}, ML-sim={top_value:.2f} < {ML_HIGH_CONFIDENCE}, trying last resort...")
+            # Match Decision
+            if matched_epg:
+                # Determine threshold
+                threshold = ML_HIGH_CONFIDENCE if best_score >= FUZZY_MEDIUM_CONFIDENCE else ML_LAST_RESORT
 
-                        # Last resort: try ML with very low fuzzy threshold
-                        if top_value >= ML_LAST_RESORT:  # Dynamic last resort threshold
-                            epg_with_names = [epg for epg in epg_data if epg.get("norm_name")]
-                            matched_epg = epg_with_names[top_index]
+                if top_value >= threshold:
+                    chan["epg_data_id"] = matched_epg["id"]
+                    channels_to_update.append(chan)
+                    matched_channels.append((chan['id'], chan['name'], matched_epg["tvg_id"]))
+                    logger.info(f"Channel {chan['id']} '{chan['name']}' => matched EPG tvg_id={matched_epg['tvg_id']} (fuzzy={best_score}, ML-sim={top_value:.2f})")
+                else:
+                    logger.info(f"Channel {chan['id']} '{chan['name']}' => ML-sim {top_value:.2f} < {threshold} (fuzzy={best_score}), skipping")
+            else:
+                 logger.info(f"Channel {chan['id']} '{chan['name']}' => no ML match found (fuzzy={best_score})")
 
-                            chan["epg_data_id"] = matched_epg["id"]
-                            channels_to_update.append(chan)
-                            matched_channels.append((chan['id'], chan['name'], matched_epg["tvg_id"]))
-                            logger.info(f"Channel {chan['id']} '{chan['name']}' => LAST RESORT match EPG tvg_id={matched_epg['tvg_id']} (fuzzy={best_score}, ML-sim={top_value:.2f})")
-                        else:
-                            logger.info(f"Channel {chan['id']} '{chan['name']}' => even last resort ML-sim {top_value:.2f} < {ML_LAST_RESORT}, skipping")
-
-                except Exception as e:
-                    logger.warning(f"ML matching failed for channel {chan['id']}: {e}")
-                    # Fall back to non-ML decision
-                    logger.info(f"Channel {chan['id']} '{chan['name']}' => fuzzy score {best_score} below threshold, skipping")
-
-        # Last resort: Try ML matching even with very low fuzzy scores
-        elif best_score >= FUZZY_LAST_RESORT_MIN and ml_available:
-            # Lazy load ML models for last resort attempts
-            if st_model is None:
-                st_model, util = get_sentence_transformer()
-
-            # Lazy generate embeddings for last resort attempts
-            if epg_embeddings is None and st_model and any(row.get("norm_name") for row in epg_data):
-                try:
-                    logger.info("Generating embeddings for EPG data using ML model (last resort lazy loading)")
-                    epg_embeddings = st_model.encode(
-                        [row["norm_name"] for row in epg_data if row.get("norm_name")],
-                        convert_to_tensor=True
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to generate embeddings for last resort: {e}")
-                    epg_embeddings = None
-
-            if epg_embeddings is not None and st_model:
-                try:
-                    logger.info(f"Channel {chan['id']} '{chan['name']}' => trying ML as last resort (fuzzy={best_score})")
-                    # Generate embedding for this channel
-                    chan_embedding = st_model.encode(chan["norm_chan"], convert_to_tensor=True)
-
-                    # Calculate similarity with all EPG embeddings
-                    sim_scores = util.cos_sim(chan_embedding, epg_embeddings)[0]
-                    top_index = int(sim_scores.argmax())
-                    top_value = float(sim_scores[top_index])
-
-                    if top_value >= ML_LAST_RESORT:  # Dynamic threshold for desperate attempts
-                        # Find the EPG entry that corresponds to this embedding index
-                        epg_with_names = [epg for epg in epg_data if epg.get("norm_name")]
-                        matched_epg = epg_with_names[top_index]
-
-                        chan["epg_data_id"] = matched_epg["id"]
-                        channels_to_update.append(chan)
-                        matched_channels.append((chan['id'], chan['name'], matched_epg["tvg_id"]))
-                        logger.info(f"Channel {chan['id']} '{chan['name']}' => DESPERATE LAST RESORT match EPG tvg_id={matched_epg['tvg_id']} (fuzzy={best_score}, ML-sim={top_value:.2f})")
-                    else:
-                        logger.info(f"Channel {chan['id']} '{chan['name']}' => desperate last resort ML-sim {top_value:.2f} < {ML_LAST_RESORT}, giving up")
-                except Exception as e:
-                    logger.warning(f"Last resort ML matching failed for channel {chan['id']}: {e}")
-                    logger.info(f"Channel {chan['id']} '{chan['name']}' => best fuzzy score={best_score} < {FUZZY_MEDIUM_CONFIDENCE}, giving up")
         else:
             # No ML available or very low fuzzy score
             logger.info(f"Channel {chan['id']} '{chan['name']}' => best fuzzy score={best_score} < {FUZZY_MEDIUM_CONFIDENCE}, no ML fallback available")

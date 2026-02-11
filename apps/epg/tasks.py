@@ -209,8 +209,19 @@ def refresh_epg_data(source_id):
 
             parse_programs_for_source(source)
 
+            # Trigger embedding update task
+            try:
+                update_epg_embeddings.delay(source.id)
+            except Exception as e:
+                logger.error(f"Failed to trigger embedding update: {e}")
+
         elif source.source_type == 'schedules_direct':
             fetch_schedules_direct(source)
+            # Trigger embedding update task
+            try:
+                update_epg_embeddings.delay(source.id)
+            except Exception as e:
+                logger.error(f"Failed to trigger embedding update: {e}")
 
         source.save(update_fields=['updated_at'])
         # After successful EPG refresh, evaluate DVR series rules to schedule new episodes
@@ -938,6 +949,7 @@ def parse_channels_only(source):
                             needs_update = False
                             if epg_obj.name != display_name:
                                 epg_obj.name = display_name
+                                epg_obj.embedding_dirty = True
                                 needs_update = True
                             if epg_obj.icon_url != icon_url:
                                 epg_obj.icon_url = icon_url
@@ -977,7 +989,7 @@ def parse_channels_only(source):
                         logger.info(f"[parse_channels_only] Bulk updating {len(epgs_to_update)} EPG entries")
                         if process:
                             logger.info(f"[parse_channels_only] Memory before bulk_update: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-                        EPGData.objects.bulk_update(epgs_to_update, ["name", "icon_url"])
+                        EPGData.objects.bulk_update(epgs_to_update, ["name", "icon_url", "embedding_dirty"])
                         if process:
                             logger.info(f"[parse_channels_only] Memory after bulk_update: {process.memory_info().rss / 1024 / 1024:.2f} MB")
                         epgs_to_update = []
@@ -1044,7 +1056,7 @@ def parse_channels_only(source):
             logger.debug(f"[parse_channels_only] Created final batch of {len(epgs_to_create)} EPG entries")
 
         if epgs_to_update:
-            EPGData.objects.bulk_update(epgs_to_update, ["name", "icon_url"])
+            EPGData.objects.bulk_update(epgs_to_update, ["name", "icon_url", "embedding_dirty"])
             logger.debug(f"[parse_channels_only] Updated final batch of {len(epgs_to_update)} EPG entries")
         if process:
             logger.debug(f"[parse_channels_only] Memory after final batch creation: {process.memory_info().rss / 1024 / 1024:.2f} MB")
@@ -2153,3 +2165,88 @@ def generate_dummy_epg(source):
     logger.warning(f"generate_dummy_epg() called for {source.name} but this function is deprecated. "
                    f"Dummy EPG programs are now generated on-demand.")
     return True
+
+@shared_task
+def update_epg_embeddings(source_id=None):
+    """
+    Generate and save embeddings for EPG data that is marked as dirty.
+    Only runs if using PostgreSQL.
+    """
+    from django.db import connection
+    if connection.vendor != 'postgresql':
+        logger.debug("Skipping embedding generation (not PostgreSQL)")
+        return "Skipped (not PostgreSQL)"
+
+    from apps.channels.tasks import get_sentence_transformer, normalize_name
+    from apps.epg.models import EPGData, EPGEmbedding
+
+    st_model, _ = get_sentence_transformer()
+    if not st_model:
+        logger.warning("ML model not available, skipping embedding generation")
+        return "ML model not available"
+
+    # Process in batches
+    batch_size = 100
+    processed = 0
+
+    while True:
+        # Get dirty EPGs
+        qs = EPGData.objects.filter(embedding_dirty=True)
+        if source_id:
+            qs = qs.filter(epg_source_id=source_id)
+
+        batch_list = list(qs[:batch_size])
+        if not batch_list:
+            break
+
+        # Prepare text
+        texts = [normalize_name(epg.name) for epg in batch_list]
+        if not texts:
+             break
+
+        try:
+            # Encode
+            embeddings = st_model.encode(texts)
+
+            to_create = []
+            to_update = []
+            epg_ids_to_update = []
+
+            # Fetch existing embeddings for this batch to decide create vs update
+            epg_ids = [e.id for e in batch_list]
+            existing_map = {e.epg_id: e for e in EPGEmbedding.objects.filter(epg_id__in=epg_ids)}
+
+            for j, epg in enumerate(batch_list):
+                embedding_vector = embeddings[j].tolist()
+
+                emb_obj = existing_map.get(epg.id)
+                if emb_obj:
+                     emb_obj.embedding = embedding_vector
+                     to_update.append(emb_obj)
+                else:
+                     to_create.append(EPGEmbedding(epg=epg, embedding=embedding_vector))
+
+                epg.embedding_dirty = False
+                epg_ids_to_update.append(epg)
+
+            # Bulk operations
+            if to_create:
+                EPGEmbedding.objects.bulk_create(to_create)
+            if to_update:
+                EPGEmbedding.objects.bulk_update(to_update, ['embedding'])
+
+            # Update dirty flag
+            if epg_ids_to_update:
+                EPGData.objects.bulk_update(epg_ids_to_update, ['embedding_dirty'])
+
+            processed += len(batch_list)
+            logger.info(f"Generated embeddings: {processed} total (current batch {len(batch_list)})")
+
+            # Memory cleanup
+            gc.collect()
+
+        except Exception as e:
+            logger.error(f"Error generating embeddings batch: {e}", exc_info=True)
+            break
+
+    return f"Updated {processed} embeddings"
