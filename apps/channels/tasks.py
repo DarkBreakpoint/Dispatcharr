@@ -14,7 +14,7 @@ import gc
 
 from celery import shared_task
 from django.utils.text import slugify
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 from apps.channels.models import Channel
 from apps.epg.models import EPGData
@@ -127,6 +127,7 @@ def get_sentence_transformer():
 BEST_FUZZY_THRESHOLD = 85
 LOWER_FUZZY_THRESHOLD = 40
 EMBED_SIM_THRESHOLD = 0.65
+MAX_MATCH_BONUS = 15
 
 # Words we remove to help with fuzzy + embedding matching
 COMMON_EXTRANEOUS_WORDS = [
@@ -262,6 +263,9 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
     epg_embeddings = None
     ml_available = use_ml
 
+    # Precompute normalized names for optimized fuzzy matching
+    epg_names = [row.get("norm_name", "") for row in epg_data]
+
     # Automatically determine matching strategy based on number of channels
     is_bulk_matching = len(channels_data) > 1
 
@@ -339,11 +343,23 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
         logger.debug(f"Fuzzy matching '{chan['norm_chan']}' against EPG entries...")
 
         # Find best fuzzy match
-        for row in epg_data:
+        candidates = process.extract(
+            chan["norm_chan"],
+            epg_names,
+            scorer=fuzz.ratio,
+            limit=None,
+            processor=None
+        )
+
+        for _, base_score, idx in candidates:
+            row = epg_data[idx]
             if not row.get("norm_name"):
                 continue
 
-            base_score = fuzz.ratio(chan["norm_chan"], row["norm_name"])
+            # Optimization: If base_score + max_possible_bonus <= best_score, we can stop
+            if best_epg and (base_score + MAX_MATCH_BONUS <= best_score):
+                break
+
             bonus = 0
 
             # Apply region-based bonus/penalty
