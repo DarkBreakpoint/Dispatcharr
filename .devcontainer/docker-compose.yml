@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+      args:
+        # Use python 3.13 variant
+        VARIANT: "3.13"
+
+    volumes:
+      # Mount the entire repository to /workspace
+      - ..:/workspace:cached
+      # Keep uv cache
+      - uv-cache:/home/vscode/.cache/uv
+
+    # Environment variables for development
+    environment:
+      - DISPATCHARR_ENV=dev
+      - PYTHONUNBUFFERED=1
+      - DJANGO_SETTINGS_MODULE=dispatcharr.settings
+
+      # Database connection
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=dispatcharr
+      - POSTGRES_USER=dispatch
+      - POSTGRES_PASSWORD=secret
+
+      # Redis connection
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+
+    # Overrides default command so things don't shut down after the process ends.
+    command: sleep infinity
+
+    # Connect to other services
+    depends_on:
+      - db
+      - redis
+
+    # Network configuration
+    #network_mode: service:db # This would share network with db, but bridge is better for multiple services
+
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=dispatcharr
+      - POSTGRES_USER=dispatch
+      - POSTGRES_PASSWORD=secret
+
+  redis:
+    image: redis:latest
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    ports:
+      - 8082:80
+    depends_on:
+      - db
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    restart: unless-stopped
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - 8081:8081
+    depends_on:
+      - redis
+
+volumes:
+  postgres-data:
+  redis-data:
+  pgadmin-data:
+  uv-cache:
