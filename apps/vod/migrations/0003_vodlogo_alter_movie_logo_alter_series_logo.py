@@ -2,6 +2,7 @@
 
 import django.db.models.deletion
 from django.db import migrations, models
+from django.db import connection
 
 
 def migrate_vod_logos_forward(apps, schema_editor):
@@ -20,42 +21,90 @@ def migrate_vod_logos_forward(apps, schema_editor):
         # Step 1: Copy unique logos from Logo table to VODLogo table
         # Only copy logos that are used by movies or series
         print("Copying logos to VODLogo table...")
-        cursor.execute("""
-            INSERT INTO vod_vodlogo (name, url)
-            SELECT DISTINCT l.name, l.url
-            FROM dispatcharr_channels_logo l
-            WHERE l.id IN (
-                SELECT DISTINCT logo_id FROM vod_movie WHERE logo_id IS NOT NULL
-                UNION
-                SELECT DISTINCT logo_id FROM vod_series WHERE logo_id IS NOT NULL
-            )
-            ON CONFLICT (url) DO NOTHING
-        """)
+
+        if connection.vendor == 'sqlite':
+            cursor.execute("""
+                INSERT OR IGNORE INTO vod_vodlogo (name, url)
+                SELECT DISTINCT l.name, l.url
+                FROM dispatcharr_channels_logo l
+                WHERE l.id IN (
+                    SELECT DISTINCT logo_id FROM vod_movie WHERE logo_id IS NOT NULL
+                    UNION
+                    SELECT DISTINCT logo_id FROM vod_series WHERE logo_id IS NOT NULL
+                )
+            """)
+        else:
+            cursor.execute("""
+                INSERT INTO vod_vodlogo (name, url)
+                SELECT DISTINCT l.name, l.url
+                FROM dispatcharr_channels_logo l
+                WHERE l.id IN (
+                    SELECT DISTINCT logo_id FROM vod_movie WHERE logo_id IS NOT NULL
+                    UNION
+                    SELECT DISTINCT logo_id FROM vod_series WHERE logo_id IS NOT NULL
+                )
+                ON CONFLICT (url) DO NOTHING
+            """)
         print(f"Created VODLogo entries")
 
         # Step 2: Update movies to point to VODLogo IDs using JOIN
         print("Updating movie references...")
-        cursor.execute("""
-            UPDATE vod_movie m
-            SET logo_id = v.id
-            FROM dispatcharr_channels_logo l
-            INNER JOIN vod_vodlogo v ON l.url = v.url
-            WHERE m.logo_id = l.id
-            AND m.logo_id IS NOT NULL
-        """)
+        if connection.vendor == 'sqlite':
+            # SQLite supports UPDATE FROM in newer versions, but safely:
+            cursor.execute("""
+                UPDATE vod_movie
+                SET logo_id = (
+                    SELECT v.id
+                    FROM dispatcharr_channels_logo l
+                    INNER JOIN vod_vodlogo v ON l.url = v.url
+                    WHERE vod_movie.logo_id = l.id
+                )
+                WHERE logo_id IS NOT NULL AND EXISTS (
+                    SELECT 1
+                    FROM dispatcharr_channels_logo l
+                    INNER JOIN vod_vodlogo v ON l.url = v.url
+                    WHERE vod_movie.logo_id = l.id
+                )
+            """)
+        else:
+            cursor.execute("""
+                UPDATE vod_movie m
+                SET logo_id = v.id
+                FROM dispatcharr_channels_logo l
+                INNER JOIN vod_vodlogo v ON l.url = v.url
+                WHERE m.logo_id = l.id
+                AND m.logo_id IS NOT NULL
+            """)
         movie_count = cursor.rowcount
         print(f"Updated {movie_count} movies with new VOD logo references")
 
         # Step 3: Update series to point to VODLogo IDs using JOIN
         print("Updating series references...")
-        cursor.execute("""
-            UPDATE vod_series s
-            SET logo_id = v.id
-            FROM dispatcharr_channels_logo l
-            INNER JOIN vod_vodlogo v ON l.url = v.url
-            WHERE s.logo_id = l.id
-            AND s.logo_id IS NOT NULL
-        """)
+        if connection.vendor == 'sqlite':
+            cursor.execute("""
+                UPDATE vod_series
+                SET logo_id = (
+                    SELECT v.id
+                    FROM dispatcharr_channels_logo l
+                    INNER JOIN vod_vodlogo v ON l.url = v.url
+                    WHERE vod_series.logo_id = l.id
+                )
+                WHERE logo_id IS NOT NULL AND EXISTS (
+                    SELECT 1
+                    FROM dispatcharr_channels_logo l
+                    INNER JOIN vod_vodlogo v ON l.url = v.url
+                    WHERE vod_series.logo_id = l.id
+                )
+            """)
+        else:
+            cursor.execute("""
+                UPDATE vod_series s
+                SET logo_id = v.id
+                FROM dispatcharr_channels_logo l
+                INNER JOIN vod_vodlogo v ON l.url = v.url
+                WHERE s.logo_id = l.id
+                AND s.logo_id IS NOT NULL
+            """)
         series_count = cursor.rowcount
         print(f"Updated {series_count} series with new VOD logo references")
 
@@ -202,6 +251,7 @@ class Migration(migrations.Migration):
 
         # Step 2: Remove foreign key constraints temporarily (so we can change the IDs)
         # We need to find and drop the actual constraint names dynamically
+        # Only run this on Postgres, as SQLite handles this differently (via table rebuilds in AlterField)
         migrations.RunSQL(
             sql=[
                 # Drop movie logo constraint (find it dynamically)
@@ -236,7 +286,7 @@ class Migration(migrations.Migration):
                     END IF;
                 END $$;
                 """,
-            ],
+            ] if connection.vendor != 'sqlite' else [],
             reverse_sql=[
                 # The AlterField operations will recreate the constraints pointing to VODLogo,
                 # so we don't need to manually recreate them in reverse
