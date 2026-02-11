@@ -3059,42 +3059,61 @@ def set_channels_logos_from_epg(self, channel_ids):
             # Get channels and their EPG data
             channels = Channel.objects.filter(id__in=batch_ids).select_related('epg_data', 'logo')
 
+            # Optimized logo processing
+            channel_url_map = {}
+            valid_urls = set()
+
+            # First pass: Collect URLs
             for channel in channels:
                 try:
                     if channel.epg_data and channel.epg_data.icon_url:
                         icon_url = channel.epg_data.icon_url.strip()
-
-                        # Try to find existing logo with this URL
-                        try:
-                            logo = Logo.objects.get(url=icon_url)
-                        except Logo.DoesNotExist:
-                            # Create new logo from EPG icon URL
-                            try:
-                                # Generate a name for the logo
-                                logo_name = channel.epg_data.name or f"Logo for {channel.epg_data.tvg_id}"
-
-                                # Create the logo record
-                                logo = Logo.objects.create(
-                                    name=logo_name,
-                                    url=icon_url
-                                )
-                                created_logos_count += 1
-                                logger.info(f"Created new logo from EPG: {logo_name} - {icon_url}")
-
-                            except Exception as create_error:
-                                errors.append(f"Channel {channel.id}: Failed to create logo from {icon_url}: {str(create_error)}")
-                                logger.error(f"Failed to create logo for channel {channel.id}: {create_error}")
-                                continue
-
-                        # Update channel logo if different
-                        if channel.logo != logo:
-                            channel.logo = logo
-                            batch_updates.append(channel)
-                            updated_count += 1
-
+                        if icon_url:
+                            if icon_url not in channel_url_map:
+                                channel_url_map[icon_url] = []
+                            channel_url_map[icon_url].append(channel)
+                            valid_urls.add(icon_url)
                 except Exception as e:
-                    errors.append(f"Channel {channel.id}: {str(e)}")
+                    errors.append(f"Channel {channel.id}: Error collecting URL: {str(e)}")
                     logger.error(f"Error processing channel {channel.id}: {e}")
+
+            if valid_urls:
+                # Fetch existing logos
+                existing_logos = {l.url: l for l in Logo.objects.filter(url__in=valid_urls)}
+
+                # Identify missing logos
+                missing_urls = valid_urls - set(existing_logos.keys())
+
+                if missing_urls:
+                    new_logos = []
+                    for url in missing_urls:
+                        # Use the first channel's EPG name for the logo
+                        first_channel = channel_url_map[url][0]
+                        logo_name = first_channel.epg_data.name or f"Logo for {first_channel.epg_data.tvg_id}"
+                        new_logos.append(Logo(name=logo_name, url=url))
+
+                    if new_logos:
+                        try:
+                            Logo.objects.bulk_create(new_logos, ignore_conflicts=True)
+                            created_logos_count += len(new_logos)
+                            logger.info(f"Batch created {len(new_logos)} new logos from EPG")
+                        except Exception as create_error:
+                            logger.error(f"Failed to bulk create logos: {create_error}")
+                            errors.append(f"Batch creation failed: {str(create_error)}")
+
+                    # Refresh existing_logos to include newly created ones
+                    # We refetch all valid_urls to ensure we have the objects with IDs
+                    existing_logos = {l.url: l for l in Logo.objects.filter(url__in=valid_urls)}
+
+                # Assign logos to channels
+                for url, channels_with_url in channel_url_map.items():
+                    logo = existing_logos.get(url)
+                    if logo:
+                        for channel in channels_with_url:
+                            if channel.logo != logo:
+                                channel.logo = logo
+                                batch_updates.append(channel)
+                                updated_count += 1
 
             # Bulk update the batch
             if batch_updates:
