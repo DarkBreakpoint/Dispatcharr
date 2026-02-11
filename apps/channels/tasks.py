@@ -136,7 +136,7 @@ COMMON_EXTRANEOUS_WORDS = [
     "film", "movie", "movies"
 ]
 
-def normalize_name(name: str) -> str:
+def normalize_name(name: str, settings=None) -> str:
     """
     A more aggressive normalization that:
       - Removes user-configured prefixes/suffixes/custom strings (only if mode is 'advanced')
@@ -155,8 +155,9 @@ def normalize_name(name: str) -> str:
     custom_strings = []
 
     try:
-        from core.models import CoreSettings
-        settings = CoreSettings.get_epg_settings()
+        if settings is None:
+            from core.models import CoreSettings
+            settings = CoreSettings.get_epg_settings()
 
         # Check if user has enabled advanced mode
         mode = settings.get("epg_match_mode", "default")
@@ -967,38 +968,106 @@ def evaluate_series_rules_impl(tvg_id: str | None = None):
         except Exception:
             continue
 
+    # Collect all TVG IDs from rules
+    rule_tvg_ids = set()
+    for rule in rules:
+        rv_tvg = str(rule.get("tvg_id") or "").strip()
+        if rv_tvg:
+            rule_tvg_ids.add(rv_tvg)
+
+    if not rule_tvg_ids:
+        return result
+
+    # Bulk fetch EPGData
+    # Use dictionary to map tvg_id -> EPGData
+    epg_map = {}
+    epgs = EPGData.objects.filter(tvg_id__in=rule_tvg_ids)
+    for epg in epgs:
+        if epg.tvg_id not in epg_map:
+            epg_map[epg.tvg_id] = epg
+
+    # Bulk fetch Channels
+    # We need the first channel for each EPG.
+    # Fetch all channels for these EPGs, ordered by channel_number
+    channels_qs = Channel.objects.filter(epg_data__in=epg_map.values()).order_by("channel_number")
+    epg_channel_map = {}  # epg_id -> Channel
+    relevant_channel_ids = set()
+    for channel in channels_qs:
+        if channel.epg_data_id not in epg_channel_map:
+            epg_channel_map[channel.epg_data_id] = channel
+            relevant_channel_ids.add(channel.id)
+
+    # Bulk fetch ProgramData
+    # Fetch all programs for these EPGs in the time window
+    # Map: epg_id -> list of ProgramData
+    programs_map = {}
+    programs_qs = ProgramData.objects.filter(
+        epg__in=epg_map.values(),
+        start_time__gte=now,
+        start_time__lte=horizon
+    ).order_by("start_time")
+
+    for prog in programs_qs:
+        if prog.epg_id not in programs_map:
+            programs_map[prog.epg_id] = []
+        programs_map[prog.epg_id].append(prog)
+
+    # Bulk fetch existing Recordings for relevant channels in time window
+    # Map: (channel_id, start_time, end_time) -> list of Recording objects (with custom_properties)
+    recordings_map = {}
+    recordings_qs = Recording.objects.filter(
+        channel_id__in=relevant_channel_ids,
+        start_time__gte=now,
+        start_time__lte=horizon + timedelta(days=1)
+    )
+
+    for rec in recordings_qs:
+        key = (rec.channel_id, rec.start_time, rec.end_time)
+        if key not in recordings_map:
+            recordings_map[key] = []
+        recordings_map[key].append(rec)
+
+    # Pre-calculate offsets
+    try:
+        pre_min = int(CoreSettings.get_dvr_pre_offset_minutes())
+    except Exception:
+        pre_min = 0
+    try:
+        post_min = int(CoreSettings.get_dvr_post_offset_minutes())
+    except Exception:
+        post_min = 0
+
+    # Pre-fetch EPG settings to avoid N+1 queries in normalize_name
+    try:
+        epg_settings = CoreSettings.get_epg_settings()
+    except Exception:
+        epg_settings = {}
+
     for rule in rules:
         rv_tvg = str(rule.get("tvg_id") or "").strip()
         mode = (rule.get("mode") or "all").lower()
         series_title = (rule.get("title") or "").strip()
-        norm_series = normalize_name(series_title) if series_title else None
+        norm_series = normalize_name(series_title, settings=epg_settings) if series_title else None
         if not rv_tvg:
             result["details"].append({"tvg_id": rv_tvg, "status": "invalid_rule"})
             continue
 
-        epg = EPGData.objects.filter(tvg_id=rv_tvg).first()
+        epg = epg_map.get(rv_tvg)
         if not epg:
             result["details"].append({"tvg_id": rv_tvg, "status": "no_epg_match"})
             continue
 
-        programs_qs = ProgramData.objects.filter(
-                epg=epg,
-                start_time__gte=now,
-                start_time__lte=horizon,
-            )
-        if series_title:
-            programs_qs = programs_qs.filter(title__iexact=series_title)
-        programs = list(programs_qs.order_by("start_time"))
-        # Fallback: if no direct matches and we have a title, try normalized comparison in Python
-        if series_title and not programs:
-            all_progs = ProgramData.objects.filter(
-                epg=epg,
-                start_time__gte=now,
-                start_time__lte=horizon,
-            ).only("id", "title", "start_time", "end_time", "custom_properties", "tvg_id")
-            programs = [p for p in all_progs if normalize_name(p.title) == norm_series]
+        all_epg_programs = programs_map.get(epg.id, [])
 
-        channel = Channel.objects.filter(epg_data=epg).order_by("channel_number").first()
+        programs = []
+        if series_title:
+            programs = [p for p in all_epg_programs if p.title and p.title.lower() == series_title.lower()]
+            if not programs:
+                programs = [p for p in all_epg_programs if normalize_name(p.title, settings=epg_settings) == norm_series]
+        else:
+            programs = list(all_epg_programs)
+
+        channel = epg_channel_map.get(epg.id)
         if not channel:
             result["details"].append({"tvg_id": rv_tvg, "status": "no_channel_for_epg"})
             continue
@@ -1063,25 +1132,20 @@ def evaluate_series_rules_impl(tvg_id: str | None = None):
                     continue
                 # Extra guard: skip if a recording exists for the same channel + timeslot
                 try:
-                    from django.db.models import Q
-                    if Recording.objects.filter(
-                        channel=channel,
-                        start_time=prog.start_time,
-                        end_time=prog.end_time,
-                    ).filter(Q(custom_properties__program__id=prog.id) | Q(custom_properties__program__title=prog.title)).exists():
+                    # Check against pre-fetched recordings + in-memory updates
+                    rec_key = (channel.id, prog.start_time, prog.end_time)
+                    existing_recs = recordings_map.get(rec_key, [])
+                    already_recorded = False
+                    for rec in existing_recs:
+                        cp = rec.custom_properties or {}
+                        cp_prog = cp.get("program", {})
+                        if str(cp_prog.get("id")) == str(prog.id) or cp_prog.get("title") == prog.title:
+                            already_recorded = True
+                            break
+                    if already_recorded:
                         continue
                 except Exception:
                     continue  # already scheduled/recorded
-
-                # Apply global DVR pre/post offsets (in minutes)
-                try:
-                    pre_min = int(CoreSettings.get_dvr_pre_offset_minutes())
-                except Exception:
-                    pre_min = 0
-                try:
-                    post_min = int(CoreSettings.get_dvr_post_offset_minutes())
-                except Exception:
-                    post_min = 0
 
                 adj_start = prog.start_time
                 adj_end = prog.end_time
@@ -1113,6 +1177,14 @@ def evaluate_series_rules_impl(tvg_id: str | None = None):
                     },
                 )
                 existing_program_ids.add(str(prog.id))
+
+                # Update our cache if offsets are 0 (exact match)
+                if pre_min == 0 and post_min == 0:
+                    rec_key = (channel.id, prog.start_time, prog.end_time)
+                    if rec_key not in recordings_map:
+                        recordings_map[rec_key] = []
+                    recordings_map[rec_key].append(rec)
+
                 created_here += 1
                 try:
                     prefetch_recording_artwork.apply_async(args=[rec.id], countdown=1)

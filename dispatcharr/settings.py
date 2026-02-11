@@ -137,7 +137,7 @@ if os.getenv("DB_ENGINE", None) == "sqlite":
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
-            "NAME": "/data/dispatcharr.db",
+            "NAME": os.environ.get("SQLITE_DB_PATH", "/data/dispatcharr.db"),
         }
     }
 else:
