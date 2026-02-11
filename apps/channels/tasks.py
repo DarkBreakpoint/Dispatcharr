@@ -2689,6 +2689,16 @@ def bulk_create_channels_from_streams(self, stream_ids, channel_profile_ids=None
                 'message': f'Processing streams {processed + 1}-{min(processed + batch_size, total_streams)} of {total_streams}...'
             })
 
+            # Prefetch EPGData for the current batch to avoid N+1 queries
+            batch_tvg_ids = [stream.tvg_id for stream in batch_streams if stream.tvg_id]
+            epg_map = {}
+            if batch_tvg_ids:
+                # Use name as tiebreaker or arbitrary first one
+                epgs = EPGData.objects.filter(tvg_id__in=batch_tvg_ids).values('tvg_id', 'id')
+                for epg in epgs:
+                    if epg['tvg_id'] not in epg_map:
+                        epg_map[epg['tvg_id']] = epg['id']
+
             for stream in batch_streams:
                 try:
                     name = stream.name
@@ -2712,10 +2722,9 @@ def bulk_create_channels_from_streams(self, stream_ids, channel_profile_ids=None
                         tvc_guide_stationid = stream_custom_props["tvc-guide-stationid"]
 
                     # Check if the determined/provider number is available
-                    if channel_number is not None and (
-                        channel_number in used_numbers
-                        or Channel.objects.filter(channel_number=channel_number).exists()
-                    ):
+                    # We rely on used_numbers set which is initialized with all existing channel numbers
+                    # This avoids an N+1 query to check existence for every channel
+                    if channel_number is not None and channel_number in used_numbers:
                         # Provider number is taken, use auto-assignment
                         channel_number = get_auto_number()
                     elif channel_number is not None:
@@ -2737,10 +2746,9 @@ def bulk_create_channels_from_streams(self, stream_ids, channel_profile_ids=None
                     if channel_group:
                         channel_data["channel_group_id"] = channel_group.id
 
-                    # Attempt to find existing EPGs with the same tvg-id
-                    epgs = EPGData.objects.filter(tvg_id=stream.tvg_id)
-                    if epgs:
-                        channel_data["epg_data_id"] = epgs.first().id
+                    # Attempt to find existing EPGs with the same tvg-id using pre-fetched map
+                    if stream.tvg_id and stream.tvg_id in epg_map:
+                        channel_data["epg_data_id"] = epg_map[stream.tvg_id]
 
                     channel = Channel(**channel_data)
                     channels_to_create.append(channel)
@@ -2810,6 +2818,10 @@ def bulk_create_channels_from_streams(self, stream_ids, channel_profile_ids=None
                 channel_stream_associations = []
                 channel_profile_memberships = []
 
+                # Prefetch profiles to avoid N+1 queries
+                cached_all_profiles = None
+                cached_specific_profiles = {}  # Map frozenset(ids) -> list of profiles
+
                 for channel, stream_ids, logo_url, profile_ids in zip(
                     created_channels, streams_map, logo_map, profile_map
                 ):
@@ -2830,48 +2842,49 @@ def bulk_create_channels_from_streams(self, stream_ids, channel_profile_ids=None
                     # - Empty array []: add to NO profiles
                     # - Sentinel [0] or 0 in array: add to ALL profiles (explicit)
                     # - [1,2,...]: add to specified profile IDs only
+
+                    profiles_to_add = []
+
                     if profile_ids is None:
-                        # Omitted -> add to all profiles (backward compatible)
-                        all_profiles = ChannelProfile.objects.all()
-                        channel_profile_memberships.extend([
-                            ChannelProfileMembership(
-                                channel_profile=profile,
-                                channel=channel,
-                                enabled=True
-                            )
-                            for profile in all_profiles
-                        ])
+                        # Omitted -> add to all profiles
+                        if cached_all_profiles is None:
+                            cached_all_profiles = list(ChannelProfile.objects.all())
+                        profiles_to_add = cached_all_profiles
+
                     elif isinstance(profile_ids, list) and len(profile_ids) == 0:
                         # Empty array -> add to no profiles
-                        pass
+                        profiles_to_add = []
+
                     elif isinstance(profile_ids, list) and 0 in profile_ids:
-                        # Sentinel 0 -> add to all profiles (explicit)
-                        all_profiles = ChannelProfile.objects.all()
-                        channel_profile_memberships.extend([
-                            ChannelProfileMembership(
-                                channel_profile=profile,
-                                channel=channel,
-                                enabled=True
-                            )
-                            for profile in all_profiles
-                        ])
+                        # Sentinel 0 -> add to all profiles
+                        if cached_all_profiles is None:
+                            cached_all_profiles = list(ChannelProfile.objects.all())
+                        profiles_to_add = cached_all_profiles
+
                     else:
                         # Specific profile IDs
                         try:
-                            specific_profiles = ChannelProfile.objects.filter(id__in=profile_ids)
-                            channel_profile_memberships.extend([
-                                ChannelProfileMembership(
-                                    channel_profile=profile,
-                                    channel=channel,
-                                    enabled=True
-                                )
-                                for profile in specific_profiles
-                            ])
+                            # Use frozenset as key for caching
+                            profile_key = frozenset(profile_ids)
+                            if profile_key not in cached_specific_profiles:
+                                cached_specific_profiles[profile_key] = list(ChannelProfile.objects.filter(id__in=profile_ids))
+                            profiles_to_add = cached_specific_profiles.get(profile_key, [])
                         except Exception as e:
                             errors.append({
                                 'channel_id': channel.id,
-                                'error': f'Failed to add to profiles: {str(e)}'
+                                'error': f'Failed to fetch profiles: {str(e)}'
                             })
+                            continue
+
+                    if profiles_to_add:
+                        channel_profile_memberships.extend([
+                            ChannelProfileMembership(
+                                channel_profile=profile,
+                                channel=channel,
+                                enabled=True
+                            )
+                            for profile in profiles_to_add
+                        ])
 
                 # Bulk update channels with logos
                 if update:
