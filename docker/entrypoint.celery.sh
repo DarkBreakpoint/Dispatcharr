@@ -9,12 +9,17 @@ echo 'Waiting for Django secret key...'
 while [ ! -f /data/jwt ]; do sleep 1; done
 export DJANGO_SECRET_KEY="$(tr -d '\r\n' < /data/jwt)"
 
-# Wait for migrations to complete (check that NO unapplied migrations remain)
+# Wait for migrations to complete (check that command succeeds AND no unapplied migrations remain)
 echo 'Waiting for migrations to complete...'
-until ! python manage.py showmigrations 2>&1 | grep -q '\[ \]'; do
-    echo 'Migrations not ready yet, waiting...'
-    sleep 2
+until python manage.py showmigrations > /tmp/mig_status 2>&1 && ! grep -q '\[ \]' /tmp/mig_status; do
+    echo 'Migrations not ready yet (or DB unavailable), waiting...'
+    if [ -f /tmp/mig_status ]; then
+        # Print last line of error for visibility without spamming
+        tail -n 1 /tmp/mig_status
+    fi
+    sleep 5
 done
+rm -f /tmp/mig_status
 
 # Start Celery
 echo 'Migrations complete, starting Celery...'

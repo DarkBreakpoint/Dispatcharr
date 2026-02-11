@@ -163,23 +163,38 @@ if [[ "$DISPATCHARR_ENV" != "modular" ]]; then
     pids+=("$postgres_pid")
 else
     echo "🔗 Modular mode: Using external PostgreSQL at ${POSTGRES_HOST}:${POSTGRES_PORT}"
-    # Wait for external PostgreSQL to be ready using Python (no pg_isready needed)
+    # Wait for external PostgreSQL to be ready
     echo_with_timestamp "Waiting for external PostgreSQL to be ready..."
-    until python3 -c "
+
+    if command -v pg_isready &> /dev/null; then
+        # Use pg_isready if available (better check)
+        until pg_isready -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" >/dev/null 2>&1; do
+            echo_with_timestamp "Waiting for PostgreSQL (pg_isready) at ${POSTGRES_HOST}:${POSTGRES_PORT}..."
+            sleep 2
+        done
+    else
+        # Fallback to Python connectivity check
+        until python3 -c "
 import socket
 import sys
 try:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(2)
-    s.connect(('${POSTGRES_HOST}', ${POSTGRES_PORT}))
+    s.connect(('${POSTGRES_HOST}', int('${POSTGRES_PORT}')))
     s.close()
     sys.exit(0)
-except Exception:
+except Exception as e:
+    sys.stderr.write(str(e))
     sys.exit(1)
-" 2>/dev/null; do
-        echo_with_timestamp "Waiting for PostgreSQL at ${POSTGRES_HOST}:${POSTGRES_PORT}..."
-        sleep 1
-    done
+" >/dev/null 2>/tmp/pg_connect_error; do
+            echo_with_timestamp "Waiting for PostgreSQL (tcp) at ${POSTGRES_HOST}:${POSTGRES_PORT}..."
+            if [ -f /tmp/pg_connect_error ]; then
+                 tail -n 1 /tmp/pg_connect_error
+            fi
+            sleep 2
+        done
+        rm -f /tmp/pg_connect_error
+    fi
     echo "✅ External PostgreSQL is ready"
 
     # Check PostgreSQL version compatibility
