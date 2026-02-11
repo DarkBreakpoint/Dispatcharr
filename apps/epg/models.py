@@ -3,6 +3,7 @@ from django.utils import timezone
 from django_celery_beat.models import PeriodicTask
 from django.conf import settings
 import os
+from apps.epg.fields import SafeVectorField
 
 class EPGSource(models.Model):
     SOURCE_TYPE_CHOICES = [
@@ -146,12 +147,20 @@ class EPGData(models.Model):
         blank=True,
         related_name="epgs",
     )
+    embedding_dirty = models.BooleanField(default=True)
 
     class Meta:
         unique_together = ('tvg_id', 'epg_source')
 
     def __str__(self):
         return f"EPG Data for {self.name}"
+
+class EPGEmbedding(models.Model):
+    epg = models.OneToOneField(EPGData, on_delete=models.CASCADE, related_name='embedding')
+    embedding = SafeVectorField(dimensions=384)  # 384 for all-MiniLM-L6-v2
+
+    def __str__(self):
+        return f"Embedding for {self.epg.name}"
 
 class ProgramData(models.Model):
     # Each programme is associated with an EPGData record.
