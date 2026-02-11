@@ -129,12 +129,15 @@ LOWER_FUZZY_THRESHOLD = 40
 EMBED_SIM_THRESHOLD = 0.65
 
 # Words we remove to help with fuzzy + embedding matching
-COMMON_EXTRANEOUS_WORDS = [
+COMMON_EXTRANEOUS_WORDS = {
     "tv", "channel", "network", "television",
     "east", "west", "hd", "uhd", "24/7",
     "1080p", "720p", "540p", "480p",
     "film", "movie", "movies"
-]
+}
+
+# Pre-compiled regexes for normalization
+RE_DOT_REGION = re.compile(r'\.([a-z]{2})')
 
 def normalize_name(name: str) -> str:
     """
@@ -281,7 +284,27 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
         ML_HIGH_CONFIDENCE = 0.65       # Original threshold
         ML_LAST_RESORT = 0.50          # Original desperate threshold
         FUZZY_LAST_RESORT_MIN = 20     # Original minimum
-        logger.info("Using aggressive thresholds for single channel matching")    # Process each channel
+        logger.info("Using aggressive thresholds for single channel matching")
+
+    # Pre-calculate region bonuses for EPG data to avoid repetitive work in the loop
+    if region_code:
+        logger.info(f"Pre-calculating region bonuses for region code: {region_code}")
+        for row in epg_data:
+            row_bonus = 0
+            if row.get("tvg_id"):
+                combined_text = (row["tvg_id"].lower() + " " + row["name"].lower())
+                dot_regions = RE_DOT_REGION.findall(combined_text)
+
+                if dot_regions:
+                    if region_code in dot_regions:
+                        row_bonus = 15  # Bigger bonus for matching region
+                    else:
+                        row_bonus = -15  # Penalty for different region
+                elif region_code in combined_text:
+                    row_bonus = 10
+            row['region_bonus'] = row_bonus
+
+    # Process each channel
     for index, chan in enumerate(channels_data):
         normalized_tvg_id = chan.get("tvg_id", "")
         fallback_name = chan["tvg_id"].strip() if chan["tvg_id"] else chan["name"]
@@ -308,9 +331,9 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
 
         # Step 2: Secondary TVG ID check (legacy compatibility)
         if chan["tvg_id"]:
-            epg_match = [epg["id"] for epg in epg_data if epg["tvg_id"] == chan["tvg_id"]]
-            if epg_match:
-                chan["epg_data_id"] = epg_match[0]
+            epg_match_id = next((epg["id"] for epg in epg_data if epg["tvg_id"] == chan["tvg_id"]), None)
+            if epg_match_id:
+                chan["epg_data_id"] = epg_match_id
                 channels_to_update.append(chan)
                 matched_channels.append((chan['id'], fallback_name, chan["tvg_id"]))
                 logger.info(f"Channel {chan['id']} '{chan['name']}' => EPG found by secondary tvg_id={chan['tvg_id']}")
@@ -344,20 +367,9 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
                 continue
 
             base_score = fuzz.ratio(chan["norm_chan"], row["norm_name"])
-            bonus = 0
 
-            # Apply region-based bonus/penalty
-            if region_code and row.get("tvg_id"):
-                combined_text = row["tvg_id"].lower() + " " + row["name"].lower()
-                dot_regions = re.findall(r'\.([a-z]{2})', combined_text)
-
-                if dot_regions:
-                    if region_code in dot_regions:
-                        bonus = 15  # Bigger bonus for matching region
-                    else:
-                        bonus = -15  # Penalty for different region
-                elif region_code in combined_text:
-                    bonus = 10
+            # Use pre-calculated region bonus
+            bonus = row.get('region_bonus', 0) if region_code else 0
 
             score = base_score + bonus
 
