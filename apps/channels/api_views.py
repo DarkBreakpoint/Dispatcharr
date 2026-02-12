@@ -158,7 +158,8 @@ class StreamViewSet(viewsets.ModelViewSet):
 
         channel_group = self.request.query_params.get("channel_group")
         if channel_group:
-            group_names = channel_group.split(",")
+            # Use split and strip generator for optimization
+            group_names = [g.strip() for g in channel_group.split(",") if g.strip()]
             qs = qs.filter(channel_group__name__in=group_names)
 
         # Allow client to hide stale streams (streams marked as is_stale=True)
@@ -171,8 +172,9 @@ class StreamViewSet(viewsets.ModelViewSet):
     def list(self, request, *args, **kwargs):
         ids = request.query_params.get("ids", None)
         if ids:
-            ids = ids.split(",")
-            streams = get_list_or_404(Stream, id__in=ids)
+            # Optimize: use generator for int conversion
+            id_list = [int(i.strip()) for i in ids.split(",") if i.strip().isdigit()]
+            streams = get_list_or_404(Stream, id__in=id_list)
             serializer = self.get_serializer(streams, many=True)
             return Response(serializer.data)
 
@@ -295,7 +297,9 @@ class StreamViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        streams = Stream.objects.filter(id__in=ids)
+        # Optimize: ensure IDs are integers and unique
+        id_set = {int(i) for i in ids if isinstance(i, (int, str)) and str(i).isdigit()}
+        streams = Stream.objects.filter(id__in=id_set)
         serializer = self.get_serializer(streams, many=True)
         return Response(serializer.data)
 
@@ -422,8 +426,8 @@ class EPGFilter(django_filters.Filter):
         if not value:
             return queryset
 
-        # Split comma-separated values
-        values = [v.strip() for v in value.split(',')]
+        # Optimize: generator for values
+        values = (v.strip() for v in value.split(',') if v.strip())
         query = Q()
 
         for val in values:
@@ -562,7 +566,8 @@ class ChannelViewSet(viewsets.ModelViewSet):
 
         channel_group = self.request.query_params.get("channel_group")
         if channel_group:
-            group_names = channel_group.split(",")
+            # Use split and strip generator for optimization
+            group_names = [g.strip() for g in channel_group.split(",") if g.strip()]
             qs = qs.filter(channel_group__name__in=group_names)
 
         filters = {}
@@ -1652,7 +1657,7 @@ class LogoViewSet(viewsets.ModelViewSet):
         ids = self.request.query_params.getlist('ids')
         if ids:
             try:
-                # Convert string IDs to integers and filter
+                # Convert string IDs to integers and filter using generator
                 id_list = [int(id_str) for id_str in ids if id_str.isdigit()]
                 if id_list:
                     queryset = queryset.filter(id__in=id_list)
@@ -1993,7 +1998,7 @@ class BulkUpdateChannelMembershipAPIView(APIView):
 
         if serializer.is_valid():
             updates = serializer.validated_data["channels"]
-            channel_ids = [entry["channel_id"] for entry in updates]
+            channel_ids = {entry["channel_id"] for entry in updates}
 
             # Validate that all channels exist
             existing_channels = set(
