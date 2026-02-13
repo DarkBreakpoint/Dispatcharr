@@ -20,7 +20,7 @@ import VODsPage from './pages/VODs';
 import useAuthStore from './store/auth';
 import FloatingVideo from './components/FloatingVideo';
 import { WebsocketProvider } from './WebSocket';
-import { Box, AppShell, MantineProvider } from '@mantine/core';
+import { Box, AppShell, MantineProvider, Loader } from '@mantine/core';
 import '@mantine/core/styles.css'; // Ensure Mantine global styles load
 import '@mantine/notifications/styles.css';
 import '@mantine/dropzone/styles.css';
@@ -48,6 +48,9 @@ const App = () => {
 
   const authCheckStarted = useRef(false);
   const superuserCheckStarted = useRef(false);
+  const [isAuthChecking, setIsAuthChecking] = useState(
+    !!localStorage.getItem('refreshToken')
+  );
 
   const toggleDrawer = () => {
     setOpen(!open);
@@ -94,6 +97,8 @@ const App = () => {
       } catch (error) {
         console.error('Auth check failed:', error);
         await logout();
+      } finally {
+        setIsAuthChecking(false);
       }
     };
 
@@ -107,81 +112,98 @@ const App = () => {
       withGlobalStyles
       withNormalizeCSS
     >
-      <WebsocketProvider>
-        <Router>
-          <AppShell
-            header={{
-              height: 0,
-            }}
-            navbar={{
-              width:
-                isAuthenticated && isInitialized
-                  ? open
-                    ? drawerWidth
-                    : miniDrawerWidth
-                  : 0,
-            }}
-          >
-            {isAuthenticated && isInitialized && (
-              <Sidebar
-                drawerWidth={drawerWidth}
-                miniDrawerWidth={miniDrawerWidth}
-                collapsed={!open}
-                toggleDrawer={toggleDrawer}
-              />
-            )}
+      {isAuthChecking ? (
+        <Box
+          style={{
+            height: '100vh',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: '#18181b',
+          }}
+        >
+          <Loader size="xl" />
+        </Box>
+      ) : (
+        <WebsocketProvider>
+          <Router>
+            <AppShell
+              header={{
+                height: 0,
+              }}
+              navbar={{
+                width:
+                  isAuthenticated && isInitialized
+                    ? open
+                      ? drawerWidth
+                      : miniDrawerWidth
+                    : 0,
+              }}
+            >
+              {isAuthenticated && isInitialized && (
+                <Sidebar
+                  drawerWidth={drawerWidth}
+                  miniDrawerWidth={miniDrawerWidth}
+                  collapsed={!open}
+                  toggleDrawer={toggleDrawer}
+                />
+              )}
 
-            <AppShell.Main>
-              <Box
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  // transition: 'margin-left 0.3s',
-                  backgroundColor: '#18181b',
-                  height: '100vh',
-                  color: 'white',
-                }}
-              >
-                <Box sx={{ p: 2, flex: 1, overflow: 'auto' }}>
-                  <Routes>
-                    {isAuthenticated && isInitialized ? (
-                      <>
-                        <Route path="/channels" element={<Channels />} />
-                        <Route path="/sources" element={<ContentSources />} />
-                        <Route path="/guide" element={<Guide />} />
-                        <Route path="/dvr" element={<DVR />} />
-                        <Route path="/stats" element={<Stats />} />
-                        <Route path="/plugins" element={<PluginsPage />} />
-                        <Route path="/users" element={<Users />} />
-                        <Route path="/settings" element={<Settings />} />
-                        <Route path="/logos" element={<LogosPage />} />
-                        <Route path="/vods" element={<VODsPage />} />
-                      </>
-                    ) : (
-                      <Route path="/login" element={<Login needsSuperuser />} />
-                    )}
-                    <Route
-                      path="*"
-                      element={
-                        <Navigate
-                          to={
-                            isAuthenticated && isInitialized
-                              ? defaultRoute
-                              : '/login'
-                          }
-                          replace
+              <AppShell.Main>
+                <Box
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    // transition: 'margin-left 0.3s',
+                    backgroundColor: '#18181b',
+                    height: '100vh',
+                    color: 'white',
+                  }}
+                >
+                  <Box sx={{ p: 2, flex: 1, overflow: 'auto' }}>
+                    <Routes>
+                      {isAuthenticated && isInitialized ? (
+                        <>
+                          <Route path="/channels" element={<Channels />} />
+                          <Route path="/sources" element={<ContentSources />} />
+                          <Route path="/guide" element={<Guide />} />
+                          <Route path="/dvr" element={<DVR />} />
+                          <Route path="/stats" element={<Stats />} />
+                          <Route path="/plugins" element={<PluginsPage />} />
+                          <Route path="/users" element={<Users />} />
+                          <Route path="/settings" element={<Settings />} />
+                          <Route path="/logos" element={<LogosPage />} />
+                          <Route path="/vods" element={<VODsPage />} />
+                        </>
+                      ) : (
+                        <Route
+                          path="/login"
+                          element={<Login needsSuperuser />}
                         />
-                      }
-                    />
-                  </Routes>
+                      )}
+                      <Route
+                        path="*"
+                        element={
+                          <Navigate
+                            to={
+                              isAuthenticated && isInitialized
+                                ? defaultRoute
+                                : '/login'
+                            }
+                            replace
+                          />
+                        }
+                      />
+                    </Routes>
+                  </Box>
                 </Box>
-              </Box>
-            </AppShell.Main>
-          </AppShell>
-          <M3URefreshNotification />
-          <Notifications containerWidth={350} />
-        </Router>
-      </WebsocketProvider>
+              </AppShell.Main>
+            </AppShell>
+            <M3URefreshNotification />
+            <Notifications containerWidth={350} />
+          </Router>
+        </WebsocketProvider>
+      )}
 
       <FloatingVideo />
     </MantineProvider>
