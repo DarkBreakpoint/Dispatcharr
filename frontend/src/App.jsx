@@ -45,12 +45,11 @@ const App = () => {
   const initData = useAuthStore((s) => s.initData);
   const initializeAuth = useAuthStore((s) => s.initializeAuth);
   const setSuperuserExists = useAuthStore((s) => s.setSuperuserExists);
+  const isAuthChecking = useAuthStore((s) => s.isAuthChecking);
+  const setIsAuthChecking = useAuthStore((s) => s.setIsAuthChecking);
 
   const authCheckStarted = useRef(false);
   const superuserCheckStarted = useRef(false);
-  const [isAuthChecking, setIsAuthChecking] = useState(
-    !!localStorage.getItem('refreshToken')
-  );
 
   const toggleDrawer = () => {
     setOpen(!open);
