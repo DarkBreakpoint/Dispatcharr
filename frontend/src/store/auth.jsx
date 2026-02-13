@@ -23,6 +23,7 @@ const isTokenExpired = (expirationTime) => {
 
 const useAuthStore = create((set, get) => ({
   isAuthenticated: false,
+  isAuthChecking: !!localStorage.getItem('refreshToken'),
   isInitialized: false,
   isInitializing: false,
   needsSuperuser: false,
@@ -100,6 +101,7 @@ const useAuthStore = create((set, get) => ({
   setIsAuthenticated: (isAuthenticated) => set({ isAuthenticated }),
 
   setSuperuserExists: (superuserExists) => set({ superuserExists }),
+  setIsAuthChecking: (isAuthChecking) => set({ isAuthChecking }),
 
   getToken: async () => {
     const tokenExpiration = localStorage.getItem('tokenExpiration');
