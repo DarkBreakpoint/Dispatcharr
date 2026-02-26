@@ -503,21 +503,21 @@ def process_movie_batch(account, batch, categories, relations, scan_start_time=N
     existing_movies = {}
 
     # Query by TMDB IDs
-    tmdb_keys = [k for k in movie_keys.keys() if k.startswith('tmdb_')]
+    tmdb_keys = (k for k in movie_keys.keys() if k.startswith('tmdb_'))
     tmdb_ids = [k.replace('tmdb_', '') for k in tmdb_keys]
     if tmdb_ids:
         for movie in Movie.objects.filter(tmdb_id__in=tmdb_ids):
             existing_movies[f"tmdb_{movie.tmdb_id}"] = movie
 
     # Query by IMDB IDs
-    imdb_keys = [k for k in movie_keys.keys() if k.startswith('imdb_')]
+    imdb_keys = (k for k in movie_keys.keys() if k.startswith('imdb_'))
     imdb_ids = [k.replace('imdb_', '') for k in imdb_keys]
     if imdb_ids:
         for movie in Movie.objects.filter(imdb_id__in=imdb_ids):
             existing_movies[f"imdb_{movie.imdb_id}"] = movie
 
     # Query by name+year for movies without external IDs
-    name_year_keys = [k for k in movie_keys.keys() if k.startswith('name_')]
+    name_year_keys = (k for k in movie_keys.keys() if k.startswith('name_'))
     if name_year_keys:
         for movie in Movie.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True):
             key = f"name_{movie.name}_{movie.year or 'None'}"
@@ -860,21 +860,21 @@ def process_series_batch(account, batch, categories, relations, scan_start_time=
     existing_series = {}
 
     # Query by TMDB IDs
-    tmdb_keys = [k for k in series_keys.keys() if k.startswith('tmdb_')]
+    tmdb_keys = (k for k in series_keys.keys() if k.startswith('tmdb_'))
     tmdb_ids = [k.replace('tmdb_', '') for k in tmdb_keys]
     if tmdb_ids:
         for series in Series.objects.filter(tmdb_id__in=tmdb_ids):
             existing_series[f"tmdb_{series.tmdb_id}"] = series
 
     # Query by IMDB IDs
-    imdb_keys = [k for k in series_keys.keys() if k.startswith('imdb_')]
+    imdb_keys = (k for k in series_keys.keys() if k.startswith('imdb_'))
     imdb_ids = [k.replace('imdb_', '') for k in imdb_keys]
     if imdb_ids:
         for series in Series.objects.filter(imdb_id__in=imdb_ids):
             existing_series[f"imdb_{series.imdb_id}"] = series
 
     # Query by name+year for series without external IDs
-    name_year_keys = [k for k in series_keys.keys() if k.startswith('name_')]
+    name_year_keys = (k for k in series_keys.keys() if k.startswith('name_'))
     if name_year_keys:
         for series in Series.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True):
             key = f"name_{series.name}_{series.year or 'None'}"

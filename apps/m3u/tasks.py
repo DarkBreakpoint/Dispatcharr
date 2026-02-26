@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 1500  # Optimized batch size for threading
 m3u_dir = os.path.join(settings.MEDIA_ROOT, "cached_m3u")
 
+# Pre-compiled regexes
+RE_EXTINF_ATTRS = re.compile(r'([^\s]+)=(["\'])([^\2]*?)\2')
+RE_STREAM_CREATED = re.compile(r"(\d+) created")
+RE_STREAM_UPDATED = re.compile(r"(\d+) updated")
+RE_BACKREF = re.compile(r'\$(\d+)')
 
 def fetch_m3u_lines(account, use_cache=False):
     os.makedirs(m3u_dir, exist_ok=True)
@@ -458,7 +463,7 @@ def parse_extinf_line(line: str) -> dict:
     last_attr_end = 0
 
     # Use a single regex that handles both quote types
-    for match in re.finditer(r'([^\s]+)=(["\'])([^\2]*?)\2', content):
+    for match in RE_EXTINF_ATTRS.finditer(content):
         key = match.group(1)
         value = match.group(3)
         attrs[key] = value
@@ -1896,7 +1901,7 @@ def sync_auto_channels(account_id, scan_start_time=None):
                         )
                         try:
                             # Convert $1, $2, etc. to \1, \2, etc. for consistency with M3U profiles
-                            safe_replace_pattern = re.sub(r'\$(\d+)', r'\\\1', replace)
+                            safe_replace_pattern = RE_BACKREF.sub(r'\\\1', replace)
                             new_name = re.sub(
                                 name_regex_pattern, safe_replace_pattern, original_name
                             )
@@ -2294,7 +2299,7 @@ def get_transformed_credentials(account, profile=None):
         if profile and profile.search_pattern and profile.replace_pattern:
             try:
                 # Handle backreferences in the replacement pattern
-                safe_replace_pattern = re.sub(r'\$(\d+)', r'\\\1', profile.replace_pattern)
+                safe_replace_pattern = RE_BACKREF.sub(r'\\\1', profile.replace_pattern)
 
                 # Apply transformation to the complete URL
                 transformed_complete_url = re.sub(profile.search_pattern, safe_replace_pattern, complete_url)
@@ -2756,8 +2761,8 @@ def refresh_single_m3u_account(account_id):
                         # Extract stream counts from result
                         if isinstance(result, str):
                             try:
-                                created_match = re.search(r"(\d+) created", result)
-                                updated_match = re.search(r"(\d+) updated", result)
+                                created_match = RE_STREAM_CREATED.search(result)
+                                updated_match = RE_STREAM_UPDATED.search(result)
                                 if created_match and updated_match:
                                     created_count = int(created_match.group(1))
                                     updated_count = int(updated_match.group(1))
@@ -2864,8 +2869,8 @@ def refresh_single_m3u_account(account_id):
                             # Extract stream counts from result
                             if isinstance(result, str):
                                 try:
-                                    created_match = re.search(r"(\d+) created", result)
-                                    updated_match = re.search(r"(\d+) updated", result)
+                                    created_match = RE_STREAM_CREATED.search(result)
+                                    updated_match = RE_STREAM_UPDATED.search(result)
                                     if created_match and updated_match:
                                         created_count = int(created_match.group(1))
                                         updated_count = int(updated_match.group(1))

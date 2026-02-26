@@ -129,12 +129,15 @@ LOWER_FUZZY_THRESHOLD = 40
 EMBED_SIM_THRESHOLD = 0.65
 
 # Words we remove to help with fuzzy + embedding matching
-COMMON_EXTRANEOUS_WORDS = [
+COMMON_EXTRANEOUS_WORDS = {
     "tv", "channel", "network", "television",
     "east", "west", "hd", "uhd", "24/7",
     "1080p", "720p", "540p", "480p",
     "film", "movie", "movies"
-]
+}
+
+# Pre-compiled regexes for normalization
+RE_DOT_REGION = re.compile(r'\.([a-z]{2})')
 
 def normalize_name(name: str) -> str:
     """
@@ -281,7 +284,31 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
         ML_HIGH_CONFIDENCE = 0.65       # Original threshold
         ML_LAST_RESORT = 0.50          # Original desperate threshold
         FUZZY_LAST_RESORT_MIN = 20     # Original minimum
-        logger.info("Using aggressive thresholds for single channel matching")    # Process each channel
+        logger.info("Using aggressive thresholds for single channel matching")
+
+    # Pre-calculate region bonuses for EPG data to avoid repetitive work in the loop
+    if region_code:
+        logger.info(f"Pre-calculating region bonuses for region code: {region_code}")
+        for row in epg_data:
+            row_bonus = 0
+            if row.get("tvg_id"):
+                combined_text = (row["tvg_id"].lower() + " " + row["name"].lower())
+                dot_regions = RE_DOT_REGION.findall(combined_text)
+
+                if dot_regions:
+                    if region_code in dot_regions:
+                        row_bonus = 15  # Bigger bonus for matching region
+                    else:
+                        row_bonus = -15  # Penalty for different region
+                elif region_code in combined_text:
+                    row_bonus = 10
+            row['region_bonus'] = row_bonus
+
+    # Pre-calculate EPG entries with valid normalized names for ML matching
+    # This avoids filtering the list inside the loop for every channel
+    epg_with_names = [epg for epg in epg_data if epg.get("norm_name")] if ml_available else []
+
+    # Process each channel
     for index, chan in enumerate(channels_data):
         normalized_tvg_id = chan.get("tvg_id", "")
         fallback_name = chan["tvg_id"].strip() if chan["tvg_id"] else chan["name"]
@@ -308,9 +335,9 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
 
         # Step 2: Secondary TVG ID check (legacy compatibility)
         if chan["tvg_id"]:
-            epg_match = [epg["id"] for epg in epg_data if epg["tvg_id"] == chan["tvg_id"]]
-            if epg_match:
-                chan["epg_data_id"] = epg_match[0]
+            epg_match_id = next((epg["id"] for epg in epg_data if epg["tvg_id"] == chan["tvg_id"]), None)
+            if epg_match_id:
+                chan["epg_data_id"] = epg_match_id
                 channels_to_update.append(chan)
                 matched_channels.append((chan['id'], fallback_name, chan["tvg_id"]))
                 logger.info(f"Channel {chan['id']} '{chan['name']}' => EPG found by secondary tvg_id={chan['tvg_id']}")
@@ -344,20 +371,9 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
                 continue
 
             base_score = fuzz.ratio(chan["norm_chan"], row["norm_name"])
-            bonus = 0
 
-            # Apply region-based bonus/penalty
-            if region_code and row.get("tvg_id"):
-                combined_text = row["tvg_id"].lower() + " " + row["name"].lower()
-                dot_regions = re.findall(r'\.([a-z]{2})', combined_text)
-
-                if dot_regions:
-                    if region_code in dot_regions:
-                        bonus = 15  # Bigger bonus for matching region
-                    else:
-                        bonus = -15  # Penalty for different region
-                elif region_code in combined_text:
-                    bonus = 10
+            # Use pre-calculated region bonus
+            bonus = row.get('region_bonus', 0) if region_code else 0
 
             score = base_score + bonus
 
@@ -394,11 +410,11 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
                 st_model, util = get_sentence_transformer()
 
             # Lazy generate embeddings only when we actually need them
-            if epg_embeddings is None and st_model and any(row.get("norm_name") for row in epg_data):
+            if epg_embeddings is None and st_model and epg_with_names:
                 try:
                     logger.info("Generating embeddings for EPG data using ML model (lazy loading)")
                     epg_embeddings = st_model.encode(
-                        [row["norm_name"] for row in epg_data if row.get("norm_name")],
+                        [row["norm_name"] for row in epg_with_names],
                         convert_to_tensor=True
                     )
                 except Exception as e:
@@ -417,7 +433,6 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
 
                     if top_value >= ML_HIGH_CONFIDENCE:
                         # Find the EPG entry that corresponds to this embedding index
-                        epg_with_names = [epg for epg in epg_data if epg.get("norm_name")]
                         matched_epg = epg_with_names[top_index]
 
                         chan["epg_data_id"] = matched_epg["id"]
@@ -429,7 +444,6 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
 
                         # Last resort: try ML with very low fuzzy threshold
                         if top_value >= ML_LAST_RESORT:  # Dynamic last resort threshold
-                            epg_with_names = [epg for epg in epg_data if epg.get("norm_name")]
                             matched_epg = epg_with_names[top_index]
 
                             chan["epg_data_id"] = matched_epg["id"]
@@ -451,11 +465,11 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
                 st_model, util = get_sentence_transformer()
 
             # Lazy generate embeddings for last resort attempts
-            if epg_embeddings is None and st_model and any(row.get("norm_name") for row in epg_data):
+            if epg_embeddings is None and st_model and epg_with_names:
                 try:
                     logger.info("Generating embeddings for EPG data using ML model (last resort lazy loading)")
                     epg_embeddings = st_model.encode(
-                        [row["norm_name"] for row in epg_data if row.get("norm_name")],
+                        [row["norm_name"] for row in epg_with_names],
                         convert_to_tensor=True
                     )
                 except Exception as e:
@@ -475,7 +489,6 @@ def match_channels_to_epg(channels_data, epg_data, region_code=None, use_ml=True
 
                     if top_value >= ML_LAST_RESORT:  # Dynamic threshold for desperate attempts
                         # Find the EPG entry that corresponds to this embedding index
-                        epg_with_names = [epg for epg in epg_data if epg.get("norm_name")]
                         matched_epg = epg_with_names[top_index]
 
                         chan["epg_data_id"] = matched_epg["id"]
@@ -996,7 +1009,14 @@ def evaluate_series_rules_impl(tvg_id: str | None = None):
                 start_time__gte=now,
                 start_time__lte=horizon,
             ).only("id", "title", "start_time", "end_time", "custom_properties", "tvg_id")
-            programs = [p for p in all_progs if normalize_name(p.title) == norm_series]
+
+            # Optimization: Use iterator to avoid loading all objects into a list if not needed
+            # and normalize_name only once per title if duplicates exist (though less likely for titles)
+            programs = []
+            if norm_series:
+                for p in all_progs.iterator():
+                    if normalize_name(p.title) == norm_series:
+                        programs.append(p)
 
         channel = Channel.objects.filter(epg_data=epg).order_by("channel_number").first()
         if not channel:
@@ -1024,15 +1044,19 @@ def evaluate_series_rules_impl(tvg_id: str | None = None):
                 onscreen = props.get("onscreen_episode")
             except Exception:
                 season = episode = onscreen = None
-            base = f"{p.tvg_id or ''}|{(p.title or '').strip().lower()}"  # series scope
+
+            # Optimization: Use tuple key instead of string concatenation to avoid allocations
+            base_tvg = p.tvg_id or ''
+            base_title = (p.title or '').strip().lower()
+
             if season is not None and episode is not None:
-                return f"{base}|s{season}e{episode}"
+                return (base_tvg, base_title, season, episode)
             if onscreen:
-                return f"{base}|{str(onscreen).strip().lower()}"
+                return (base_tvg, base_title, str(onscreen).strip().lower())
             if p.sub_title:
-                return f"{base}|{p.sub_title.strip().lower()}"
+                return (base_tvg, base_title, p.sub_title.strip().lower())
             # No reliable episode identity; use the program id to avoid over-merging
-            return f"id:{p.id}"
+            return (base_tvg, base_title, 'id', p.id)
 
         # Optionally filter to only brand-new episodes before grouping
         if mode == "new":
@@ -1363,13 +1387,15 @@ def maintain_recurring_recordings():
 def purge_recurring_rule(rule_id: int):
     return purge_recurring_rule_impl(rule_id)
 
+# Pre-compiled regex for safe filenames
+RE_SAFE_FILENAME = re.compile(r'[\\/:*?"<>|]+')
+
 @shared_task
 def _safe_name(s):
     try:
-        import re
         s = s or ""
         # Remove forbidden filename characters and normalize spaces
-        s = re.sub(r'[\\/:*?"<>|]+', '', s)
+        s = RE_SAFE_FILENAME.sub('', s)
         s = s.strip()
         return s
     except Exception:
@@ -1390,8 +1416,18 @@ def _parse_epg_tv_movie_info(program):
         if epg_program and epg_program.custom_properties:
             cp = epg_program.custom_properties
             # Determine categories
-            cats = [c.lower() for c in (cp.get('categories') or []) if isinstance(c, str)]
-            is_movie = 'movie' in cats or 'film' in cats
+            # Optimization: Use set intersection instead of list comprehension + 'in' check
+            # This avoids creating the 'cats' list entirely if we just want to check existence
+            raw_cats = cp.get('categories') or []
+            is_movie = False
+            if raw_cats:
+                for c in raw_cats:
+                    if isinstance(c, str):
+                        c_lower = c.lower()
+                        if c_lower == 'movie' or c_lower == 'film':
+                            is_movie = True
+                            break
+
             season = cp.get('season')
             episode = cp.get('episode')
             onscreen = cp.get('onscreen_episode')
